@@ -15,7 +15,8 @@ OLLAMA_URL = "http://localhost:11434/api/tags"
 call_logs = deque(maxlen=10)
 model_counts = Counter()
 processed_log_hashes = set()
-recent_calls_cache = {}  # Tracks model_name -> timestamp to prevent double-counting multi-line entries
+processed_traffic_sigs = set()  # Prevent double-counting the same unique network call
+active_models_global = []       # Synchronized via active VRAM polling
 
 MODEL_HINTS = {
     "qwen2.5:7b": "Workhorse: Best all-around 7B",
@@ -35,8 +36,8 @@ HEADER_ASCII = """
  ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝    ╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝
 """
 
-def get_speedometer(percent, color, title, details):
-    """Creates a speedometer-style ASCII gauge displaying descriptive totals."""
+def get_speedometer(percent, color, details):
+    """Creates a speedometer-style ASCII gauge displaying clear resource totals below."""
     percent = max(0, min(100, percent))
     num_segments = 15
     filled = int((percent / 100) * num_segments)
@@ -56,13 +57,12 @@ def get_speedometer(percent, color, title, details):
     return Align.center(
         Group(
             arc,
-            Text(f"\n{title}: {percent:>3.0f}%", style=f"bold {color}"),
-            Text(details, style="dim italic")
+            Text(f"\n{details}", style="bold white")
         ), vertical="middle"
     )
 
 def get_gpu_data():
-    defaults = {"use": 0, "temp": 0, "power": "0", "vram_pct": 0, "vram_str": "0/8GB"}
+    defaults = {"use": 0, "temp": 0, "power": "0", "vram_pct": 0, "vram_str": "0.0 GB / 8.0 GB"}
     try:
         res = subprocess.run(['rocm-smi', '--showuse', '--showtemp', '--showpower', '--showmemuse', '--json'], 
                              capture_output=True, text=True, timeout=1)
@@ -79,6 +79,34 @@ def get_gpu_data():
         }
     except: return defaults
 
+def get_disk_info():
+    """Queries OS storage layout for valid physical drives, space used, and space available."""
+    drives = []
+    try:
+        for part in psutil.disk_partitions(all=False):
+            if os.name != 'nt':
+                # Strip virtual, loopback, metadata, and container-layered filesystems
+                if part.fstype in ['tmpfs', 'devtmpfs', 'devfs', 'proc', 'sysfs', 'overlay', 'squashfs']: 
+                    continue
+                if any(x in part.mountpoint for x in ['/var/lib/docker', '/snap', '/boot']):
+                    continue
+            else:
+                if 'cdrom' in part.opts or part.fstype == '': 
+                    continue
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+                if usage.total == 0: continue
+                drives.append({
+                    "mount": part.mountpoint,
+                    "used": usage.used / (1024**3),
+                    "total": usage.total / (1024**3),
+                    "free": usage.free / (1024**3),
+                    "percent": usage.percent
+                })
+            except: continue
+    except: pass
+    return drives
+
 def get_active_nodes():
     try:
         res = subprocess.run("ss -tnp | grep :11434", shell=True, capture_output=True, text=True, timeout=1)
@@ -91,10 +119,21 @@ def get_active_nodes():
         return list(nodes)
     except: return []
 
-def update_call_logs():
+def update_call_logs(active_models):
     try:
-        output = subprocess.check_output(["journalctl", "-u", "ollama", "-n", "150", "--no-pager"], text=True, timeout=1)
+        output = ""
+        # Multi-command pipeline handles both systemwide and user-space systemd logs
+        for cmd in [["journalctl", "-u", "ollama", "-n", "100", "--no-pager"], ["journalctl", "--user", "-u", "ollama", "-n", "100", "--no-pager"]]:
+            try:
+                output = subprocess.check_output(cmd, text=True, timeout=1)
+                if output.strip(): break
+            except: continue
         
+        # Fallback to checking active docker environments
+        if not output.strip():
+            try: output = subprocess.check_output(["docker", "logs", "--tail", "100", "ollama"], text=True, timeout=1)
+            except: pass
+
         for line in output.split('\n'):
             if not line.strip() or "/api/tags" in line or "/api/ps" in line: continue
             
@@ -102,49 +141,67 @@ def update_call_logs():
             if line_hash in processed_log_hashes: continue
             processed_log_hashes.add(line_hash)
             
-            # --- 1. MODEL CALLS TRACKING WITH DEBOUNCING ---
-            # Triggers on standard JSON logs or raw service markers for request initiation
-            has_event = any(k in line for k in [
-                'msg="load request"', 'msg="completion request"', 
-                '"msg":"load request"', '"msg":"completion request"',
-                'path=/api/chat', 'path=/api/generate',
-                '"path":"/api/chat"', '"path":"/api/generate"'
-            ])
-            
-            if has_event:
-                model_match = re.search(r'(?:model|model_name)[":=]+\s*["\']?([\w\.\-:]+)', line, re.IGNORECASE)
-                if model_match:
-                    raw_model = model_match.group(1).strip('"\'')
-                    current_time = time.time()
-                    
-                    # 1.5-second debounce ensures multi-line reporting per request registers as 1 count
-                    if current_time - recent_calls_cache.get(raw_model, 0) > 1.5:
-                        model_counts[raw_model] += 1
-                        recent_calls_cache[raw_model] = current_time
-
-            # --- 2. TRAFFIC LOGS (Live List) ---
             entry = None
+            is_successful_call = False
+            
+            # Extract standard key-value routing fields
             if 'status=200' in line:
                 ts_m = re.search(r'(\d{2}:\d{2}:\d{2})', line)
                 path_m = re.search(r'path=([/\w]+)', line)
                 rem_m = re.search(r'remote=([\d\.\w:]+)', line)
-                if path_m:
+                if path_m and any(x in path_m.group(1) for x in ["/api/chat", "/api/generate"]):
+                    is_successful_call = True
                     entry = {
                         "time": ts_m.group(1) if ts_m else "00:00",
                         "status": "200",
                         "source": rem_m.group(1).replace("::ffff:", "") if rem_m else "local",
                         "call": path_m.group(1)
                     }
-            elif "[GIN]" in line and " 200 " in line:
+            # Extract framework middleware formatting
+            elif "[GIN]" in line and " 200 " in line and any(x in line for x in ["/api/chat", "/api/generate"]):
                 parts = line.split("|")
                 if len(parts) >= 5:
+                    is_successful_call = True
                     ts_m = re.search(r'(\d{2}:\d{2}:\d{2})', line)
-                    entry = {"time": ts_m.group(1) if ts_m else "00:00", "status": "200", "source": parts[3].strip().replace("::ffff:", ""), "call": parts[4].strip().split()[1]}
+                    entry = {
+                        "time": ts_m.group(1) if ts_m else "00:00", 
+                        "status": "200", 
+                        "source": parts[3].strip().replace("::ffff:", ""), 
+                        "call": parts[4].strip().split()[1]
+                    }
 
             if entry and entry not in call_logs:
                 call_logs.append(entry)
-            
-            if len(processed_log_hashes) > 1500: processed_log_hashes.clear()
+
+            # --- HYBRID MEMORY ATTRIBUTION LOGIC ---
+            if is_successful_call and entry:
+                sig = f"{entry['time']}_{entry['source']}_{entry['call']}"
+                if sig not in processed_traffic_sigs:
+                    processed_traffic_sigs.add(sig)
+                    
+                    # Method 1: Look for explicit engine metadata parameters directly in the log
+                    model_match = re.search(r'(?:model|model_name)[":=]+\s*["\']?([\w\.\-:]+)', line, re.IGNORECASE)
+                    attributed = False
+                    if model_match:
+                        raw_model = model_match.group(1).strip('"\'')
+                        model_counts[raw_model] += 1
+                        attributed = True
+                    else:
+                        # Method 2: Substring verification fallback against static targets
+                        for target_key in MODEL_HINTS.keys():
+                            if target_key.split(':')[0] in line or target_key in line:
+                                model_counts[target_key] += 1
+                                attributed = True
+                                break
+                    
+                    # Method 3: Cross-reference active VRAM cache if log levels are standard/opaque
+                    if not attributed and active_models:
+                        for am in active_models:
+                            model_counts[am] += 1
+                            break
+                            
+        if len(processed_log_hashes) > 2000: processed_log_hashes.clear()
+        if len(processed_traffic_sigs) > 1000: processed_traffic_sigs.clear()
     except Exception: pass
 
 def make_layout() -> Layout:
@@ -163,25 +220,34 @@ layout = make_layout()
 try:
     with Live(layout, refresh_per_second=2, screen=True) as live:
         while True:
+            # Poll Loaded VRAM models to keep the call-tracker context-aware
+            try:
+                ps_r = requests.get("http://localhost:11434/api/ps", timeout=0.5)
+                active_models_global = [m['name'] for m in ps_r.json().get('models', [])] if ps_r.status_code == 200 else []
+            except: active_models_global = []
+
             gpu, mem = get_gpu_data(), psutil.virtual_memory()
-            update_call_logs()
+            update_call_logs(active_models_global)
             
             # Header
             layout["header"].update(Panel(Align.center(Text(HEADER_ASCII, style="bold blue"), vertical="middle"), border_style="blue"))
             
-            # Detailed Stats Speedometers
-            mem_used_gb = mem.used / (1024**3)
-            mem_total_gb = mem.total / (1024**3)
+            # Explicit Metrics Resource Gauges
+            cpu_pct = psutil.cpu_percent()
+            mem_used_gb, mem_total_gb = mem.used / (1024**3), mem.total / (1024**3)
+            
             layout["hero_stats"].update(Columns([
-                Panel(get_speedometer(psutil.cpu_percent(), "cyan", "CPU", f"Load: {psutil.cpu_percent():.0f}% | {psutil.cpu_count()} Cores"), title="SYSTEM"),
-                Panel(get_speedometer(mem.percent, "magenta", "RAM", f"{mem.percent:.0f}% used, {mem_used_gb:.1f} GB / {mem_total_gb:.1f} GB Used"), title="MEMORY"),
-                Panel(get_speedometer(gpu["use"], "red", "GPU", f"{gpu['temp']}°C | {gpu['vram_str']} Used"), title="RX 570 GPU")
+                Panel(get_speedometer(cpu_pct, "cyan", f"CPU {cpu_pct:.0f}% used, {psutil.cpu_count()} Cores Active"), title="SYSTEM"),
+                Panel(get_speedometer(mem.percent, "magenta", f"RAM {mem.percent:.0f}% used, {mem_used_gb:.1f} GB / {mem_total_gb:.1f} GB Used"), title="MEMORY"),
+                Panel(get_speedometer(gpu["use"], "red", f"GPU {gpu['use']:.0f}% used, {gpu['vram_str']} Used | {gpu['temp']}°C"), title="RX 570 GPU")
             ], expand=True))
 
-            # Models Table with Tag-Agnostic Aggregate Matching
+            # Models & OS Storage Partition Table Compilation
             try:
                 r = requests.get(OLLAMA_URL, timeout=1)
                 m_data = r.json().get('models', [])
+                
+                # Sub-Table 1: Inference Engine Inventory
                 m_t = Table(expand=True, box=None)
                 m_t.add_column("Model", style="cyan", width=22)
                 m_t.add_column("Purpose", style="dim")
@@ -192,17 +258,41 @@ try:
                     full_name = m['name'] 
                     base_name = full_name.split(':')[0]
                     
-                    # Accumulate counts where logged models intersect with installed base tags
                     count = 0
                     for logged_model, logged_count in model_counts.items():
-                        logged_base = logged_model.split(':')[0]
-                        if logged_model == full_name or logged_base == base_name or logged_model == base_name:
+                        if logged_model == full_name or logged_model.split(':')[0] == base_name or logged_model == base_name:
                             count += logged_count
                     
                     hint = MODEL_HINTS.get(full_name, MODEL_HINTS.get(base_name, "General Inference"))
                     m_t.add_row(full_name, hint, str(count), f"{m['size']/(1024**3):.1f}GB")
-                layout["models"].update(Panel(m_t, title="INSTALLED MODELS", border_style="blue"))
-            except: pass
+
+                # Sub-Table 2: OS Partition Storage Space
+                d_t = Table(expand=True, box=None)
+                d_t.add_column("Drive/Mount", style="green", width=18)
+                d_t.add_column("Used / Total", justify="right", style="cyan")
+                d_t.add_column("Available Space", justify="right", style="yellow")
+                d_t.add_column("Usage Bar", justify="right", style="magenta")
+                
+                for d in get_disk_info()[:4]:
+                    bar_w = 10
+                    fill_seg = int((d["percent"] / 100) * bar_w)
+                    ascii_bar = f"[{'█' * fill_seg}{'·' * (bar_w - fill_seg)}]"
+                    d_t.add_row(
+                        d["mount"],
+                        f"{d['used']:.1f}/{d['total']:.1f} GB",
+                        f"{d['free']:.1f} GB",
+                        f"{ascii_bar} {d['percent']:.0f}%"
+                    )
+
+                # Composite environment rendering using Group
+                env_group = Group(
+                    m_t,
+                    Text("\n" + "─" * 65, style="dim text"),
+                    Text("SYSTEM STORAGE DRIVES", style="bold green"),
+                    d_t
+                )
+                layout["models"].update(Panel(env_group, title="INSTALLED MODELS & STORAGE", border_style="blue"))
+            except Exception: pass
 
             # Node Details
             nodes = get_active_nodes()

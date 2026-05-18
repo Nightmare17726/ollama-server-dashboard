@@ -8,15 +8,14 @@ from rich.layout import Layout
 from rich.console import Group
 from rich.align import Align
 from rich.text import Text
-from rich.columns import Columns
 
 # --- CONFIGURATION ---
 OLLAMA_URL = "http://localhost:11434/api/tags"
 call_logs = deque(maxlen=10)
 model_counts = Counter()
 processed_log_hashes = set()
-processed_traffic_sigs = set()  # Prevent double-counting the same unique network call
-active_models_global = []       # Synchronized via active VRAM polling
+processed_traffic_sigs = set()  
+active_models_global = []       
 
 MODEL_HINTS = {
     "qwen2.5:7b": "Workhorse: Best all-around 7B",
@@ -36,30 +35,35 @@ HEADER_ASCII = """
  ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝    ╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝
 """
 
+def get_color_style(percent):
+    """Evaluates percentage values against thresholds and maps to appropriate styles."""
+    if percent < 50:
+        return "bold white"
+    elif percent <= 80:
+        return "bold yellow"
+    else:
+        return "bold red"
+
 def get_speedometer(percent, color, details):
-    """Creates a speedometer-style ASCII gauge displaying clear resource totals below."""
+    """Creates an ASCII gauge block centered inside its panel row with extra trailing line padding."""
     percent = max(0, min(100, percent))
     num_segments = 15
     filled = int((percent / 100) * num_segments)
     gauge_bg = "·" * (num_segments - filled)
     gauge_fill = "█" * filled
     
-    arc = Text()
-    arc.append("  ╭", style=color)
-    arc.append("─" * num_segments, style="dim")
-    arc.append("╮  \n", style=color)
+    text_style = get_color_style(percent)
     
-    arc.append(" [ ", style="white")
-    arc.append(gauge_fill, style=color)
-    arc.append(gauge_bg, style="dim")
-    arc.append(" ] ", style="white")
+    content = Text()
+    content.append(f"╭{'─' * num_segments}╮\n", style=color)
+    content.append("[ ", style="white")
+    content.append(gauge_fill, style=color)
+    content.append(gauge_bg, style="dim")
+    content.append(" ]\n", style="white")
+    content.append(details, style=text_style)
+    content.append("\n ") # Injects space under the details line inside the block
     
-    return Align.center(
-        Group(
-            arc,
-            Text(f"\n{details}", style="bold white")
-        ), vertical="middle"
-    )
+    return Align.center(content, vertical="middle")
 
 def get_gpu_data():
     defaults = {"use": 0, "temp": 0, "power": "0", "vram_pct": 0, "vram_str": "0.0 GB / 8.0 GB"}
@@ -80,12 +84,10 @@ def get_gpu_data():
     except: return defaults
 
 def get_disk_info():
-    """Queries OS storage layout for valid physical drives, space used, and space available."""
     drives = []
     try:
         for part in psutil.disk_partitions(all=False):
             if os.name != 'nt':
-                # Strip virtual, loopback, metadata, and container-layered filesystems
                 if part.fstype in ['tmpfs', 'devtmpfs', 'devfs', 'proc', 'sysfs', 'overlay', 'squashfs']: 
                     continue
                 if any(x in part.mountpoint for x in ['/var/lib/docker', '/snap', '/boot']):
@@ -122,14 +124,12 @@ def get_active_nodes():
 def update_call_logs(active_models):
     try:
         output = ""
-        # Multi-command pipeline handles both systemwide and user-space systemd logs
         for cmd in [["journalctl", "-u", "ollama", "-n", "100", "--no-pager"], ["journalctl", "--user", "-u", "ollama", "-n", "100", "--no-pager"]]:
             try:
                 output = subprocess.check_output(cmd, text=True, timeout=1)
                 if output.strip(): break
             except: continue
         
-        # Fallback to checking active docker environments
         if not output.strip():
             try: output = subprocess.check_output(["docker", "logs", "--tail", "100", "ollama"], text=True, timeout=1)
             except: pass
@@ -144,7 +144,6 @@ def update_call_logs(active_models):
             entry = None
             is_successful_call = False
             
-            # Extract standard key-value routing fields
             if 'status=200' in line:
                 ts_m = re.search(r'(\d{2}:\d{2}:\d{2})', line)
                 path_m = re.search(r'path=([/\w]+)', line)
@@ -157,7 +156,6 @@ def update_call_logs(active_models):
                         "source": rem_m.group(1).replace("::ffff:", "") if rem_m else "local",
                         "call": path_m.group(1)
                     }
-            # Extract framework middleware formatting
             elif "[GIN]" in line and " 200 " in line and any(x in line for x in ["/api/chat", "/api/generate"]):
                 parts = line.split("|")
                 if len(parts) >= 5:
@@ -173,13 +171,11 @@ def update_call_logs(active_models):
             if entry and entry not in call_logs:
                 call_logs.append(entry)
 
-            # --- HYBRID MEMORY ATTRIBUTION LOGIC ---
             if is_successful_call and entry:
                 sig = f"{entry['time']}_{entry['source']}_{entry['call']}"
                 if sig not in processed_traffic_sigs:
                     processed_traffic_sigs.add(sig)
                     
-                    # Method 1: Look for explicit engine metadata parameters directly in the log
                     model_match = re.search(r'(?:model|model_name)[":=]+\s*["\']?([\w\.\-:]+)', line, re.IGNORECASE)
                     attributed = False
                     if model_match:
@@ -187,14 +183,12 @@ def update_call_logs(active_models):
                         model_counts[raw_model] += 1
                         attributed = True
                     else:
-                        # Method 2: Substring verification fallback against static targets
                         for target_key in MODEL_HINTS.keys():
                             if target_key.split(':')[0] in line or target_key in line:
                                 model_counts[target_key] += 1
                                 attributed = True
                                 break
                     
-                    # Method 3: Cross-reference active VRAM cache if log levels are standard/opaque
                     if not attributed and active_models:
                         for am in active_models:
                             model_counts[am] += 1
@@ -208,10 +202,15 @@ def make_layout() -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=9),
-        Layout(name="hero_stats", size=10),
+        Layout(name="hero_stats", size=6), # Height scaled to exactly 6 to safely capture the space injection
         Layout(name="middle_row", ratio=2),
         Layout(name="logs", ratio=2),
         Layout(name="footer", size=3)
+    )
+    layout["hero_stats"].split_row(
+        Layout(name="cpu", ratio=1),
+        Layout(name="ram", ratio=1),
+        Layout(name="gpu", ratio=1)
     )
     layout["middle_row"].split_row(Layout(name="models", ratio=5), Layout(name="analytics", ratio=4))
     return layout
@@ -220,7 +219,6 @@ layout = make_layout()
 try:
     with Live(layout, refresh_per_second=2, screen=True) as live:
         while True:
-            # Poll Loaded VRAM models to keep the call-tracker context-aware
             try:
                 ps_r = requests.get("http://localhost:11434/api/ps", timeout=0.5)
                 active_models_global = [m['name'] for m in ps_r.json().get('models', [])] if ps_r.status_code == 200 else []
@@ -232,22 +230,19 @@ try:
             # Header
             layout["header"].update(Panel(Align.center(Text(HEADER_ASCII, style="bold blue"), vertical="middle"), border_style="blue"))
             
-            # Explicit Metrics Resource Gauges
+            # Hardware Status Grid
             cpu_pct = psutil.cpu_percent()
             mem_used_gb, mem_total_gb = mem.used / (1024**3), mem.total / (1024**3)
             
-            layout["hero_stats"].update(Columns([
-                Panel(get_speedometer(cpu_pct, "cyan", f"CPU {cpu_pct:.0f}% used, {psutil.cpu_count()} Cores Active"), title="SYSTEM"),
-                Panel(get_speedometer(mem.percent, "magenta", f"RAM {mem.percent:.0f}% used, {mem_used_gb:.1f} GB / {mem_total_gb:.1f} GB Used"), title="MEMORY"),
-                Panel(get_speedometer(gpu["use"], "red", f"GPU {gpu['use']:.0f}% used, {gpu['vram_str']} Used | {gpu['temp']}°C"), title="RX 570 GPU")
-            ], expand=True))
+            layout["cpu"].update(Panel(get_speedometer(cpu_pct, "cyan", f"CPU {cpu_pct:.0f}% | {psutil.cpu_count()} Cores"), title="SYSTEM", border_style="cyan"))
+            layout["ram"].update(Panel(get_speedometer(mem.percent, "magenta", f"RAM {mem.percent:.0f}% | {mem_used_gb:.1f}/{mem_total_gb:.1f} GB"), title="MEMORY", border_style="magenta"))
+            layout["gpu"].update(Panel(get_speedometer(gpu["use"], "red", f"GPU {gpu['use']:.0f}% | {gpu['vram_str']}"), title="RX 570 GPU", border_style="red"))
 
-            # Models & OS Storage Partition Table Compilation
+            # Models & Storage Info
             try:
                 r = requests.get(OLLAMA_URL, timeout=1)
                 m_data = r.json().get('models', [])
                 
-                # Sub-Table 1: Inference Engine Inventory
                 m_t = Table(expand=True, box=None)
                 m_t.add_column("Model", style="cyan", width=22)
                 m_t.add_column("Purpose", style="dim")
@@ -266,25 +261,27 @@ try:
                     hint = MODEL_HINTS.get(full_name, MODEL_HINTS.get(base_name, "General Inference"))
                     m_t.add_row(full_name, hint, str(count), f"{m['size']/(1024**3):.1f}GB")
 
-                # Sub-Table 2: OS Partition Storage Space
                 d_t = Table(expand=True, box=None)
                 d_t.add_column("Drive/Mount", style="green", width=18)
                 d_t.add_column("Used / Total", justify="right", style="cyan")
                 d_t.add_column("Available Space", justify="right", style="yellow")
-                d_t.add_column("Usage Bar", justify="right", style="magenta")
+                d_t.add_column("Usage Bar", justify="right")
                 
                 for d in get_disk_info()[:4]:
                     bar_w = 10
                     fill_seg = int((d["percent"] / 100) * bar_w)
                     ascii_bar = f"[{'█' * fill_seg}{'·' * (bar_w - fill_seg)}]"
+                    
+                    # Apply standardized dynamic color rule for disk arrays
+                    disk_color = get_color_style(d["percent"]).replace("bold ", "")
+                    
                     d_t.add_row(
                         d["mount"],
                         f"{d['used']:.1f}/{d['total']:.1f} GB",
                         f"{d['free']:.1f} GB",
-                        f"{ascii_bar} {d['percent']:.0f}%"
+                        Text(f"{ascii_bar} {d['percent']:.0f}%", style=disk_color)
                     )
 
-                # Composite environment rendering using Group
                 env_group = Group(
                     m_t,
                     Text("\n" + "─" * 65, style="dim text"),

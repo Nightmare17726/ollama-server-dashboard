@@ -125,47 +125,97 @@ def get_disk_info():
     except: pass
     return drives
 
+def _parse_capacity_to_gb(cap_str):
+    parts = cap_str.strip().split()
+    if len(parts) == 2:
+        try:
+            val = float(parts[0])
+            unit = parts[1].upper()
+            if unit in ('GB', 'GIB'): return val
+            if unit in ('MB', 'MIB'): return val / 1024
+            if unit in ('TB', 'TIB'): return val * 1024
+        except ValueError:
+            pass
+    return None
+
 def get_low_level_ram_data():
-    mobo = {"manufacturer": "Unknown", "model": "Unknown Tables", "root_active": True}
+    mobo = {"manufacturer": "Unknown", "model": "Unknown Tables", "root_active": True, "max_per_slot": "N/A"}
     slots = []
 
     if os.name == 'nt' or os.geteuid() != 0:
         mobo["root_active"] = False
         for i in range(1, 5):
             slots.append({
-                "locator": f"DIMM_{i}", "size": "16 GB" if i % 2 != 0 else "No Module Installed",
-                "speed": "3200 MT/s" if i % 2 != 0 else "Unknown", "type": "DDR4",
-                "ram_manufacturer": "Crucial Tech" if i % 2 != 0 else "N/A",
+                "locator": f"DIMM_{i}", "size": "8 GB" if i % 2 != 0 else "No Module Installed",
+                "max_capacity": "16 GB", "speed": "3200 MT/s" if i % 2 != 0 else "Unknown",
+                "type": "DDR4", "ram_manufacturer": "Crucial Tech" if i % 2 != 0 else "N/A",
                 "ram_model": "CT16G4DFD832A" if i % 2 != 0 else "N/A", "active": i % 2 != 0
             })
         return mobo, slots
 
+    # Type 16: Physical Memory Array — gives total max capacity and slot count
+    try:
+        raw_t16 = subprocess.check_output(["dmidecode", "-t", "16"], text=True, stderr=subprocess.DEVNULL, timeout=5)
+        max_cap_gb, num_devices = None, None
+        for line in raw_t16.split('\n'):
+            line = line.strip()
+            if line.startswith("Maximum Capacity:"):
+                max_cap_gb = _parse_capacity_to_gb(line.split(":", 1)[1])
+            elif line.startswith("Number Of Devices:"):
+                try: num_devices = int(line.split(":", 1)[1].strip())
+                except ValueError: pass
+        if max_cap_gb and num_devices and num_devices > 0:
+            per_gb = max_cap_gb / num_devices
+            mobo["max_per_slot"] = f"{int(per_gb)} GB" if per_gb == int(per_gb) else f"{per_gb:.1f} GB"
+    except: pass
+
+    # Type 2: Baseboard — motherboard make/model
     try:
         raw_t2 = subprocess.check_output(["dmidecode", "-t", "2"], text=True, stderr=subprocess.DEVNULL, timeout=5)
         for line in raw_t2.split('\n'):
             if "Manufacturer:" in line: mobo["manufacturer"] = line.split(":", 1)[1].strip()
             elif "Product Name:" in line: mobo["model"] = line.split(":", 1)[1].strip()
+    except: pass
 
+    # Type 17: Memory Device — one block per physical slot
+    try:
         raw_t17 = subprocess.check_output(["dmidecode", "-t", "17"], text=True, stderr=subprocess.DEVNULL, timeout=5)
         for block in raw_t17.split("Memory Device")[1:]:
-            slot_info = {"locator": "Unknown", "size": "No Module Installed", "speed": "N/A", "type": "N/A", "ram_manufacturer": "N/A", "ram_model": "N/A", "active": False}
+            slot_info = {
+                "locator": "Unknown", "size": "No Module Installed",
+                "max_capacity": mobo["max_per_slot"],
+                "speed": "N/A", "type": "N/A",
+                "ram_manufacturer": "N/A", "ram_model": "N/A", "active": False
+            }
             for line in block.split('\n'):
                 line = line.strip()
-                if "Locator:" in line and "Bank Locator:" not in line: slot_info["locator"] = line.split(":", 1)[1].strip()
-                elif "Size:" in line:
+                if line.startswith("Locator:") and "Bank Locator:" not in line:
+                    slot_info["locator"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Size:"):
                     sz = line.split(":", 1)[1].strip()
                     slot_info["size"] = sz
-                    if "No Module" not in sz and "Unknown" not in sz: slot_info["active"] = True
-                elif "Speed:" in line and "Configured" not in line: slot_info["speed"] = line.split(":", 1)[1].strip()
-                elif "Type:" in line and "Detail" not in line: slot_info["type"] = line.split(":", 1)[1].strip()
-                elif "Manufacturer:" in line: slot_info["ram_manufacturer"] = line.split(":", 1)[1].strip()
-                elif "Part Number:" in line: slot_info["ram_model"] = line.split(":", 1)[1].strip()
+                    if sz not in ("No Module Installed", "Unknown", "0") and sz != "0 MB":
+                        slot_info["active"] = True
+                elif line.startswith("Speed:") and "Configured" not in line:
+                    slot_info["speed"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Type:") and "Detail" not in line:
+                    slot_info["type"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Manufacturer:"):
+                    slot_info["ram_manufacturer"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Part Number:"):
+                    slot_info["ram_model"] = line.split(":", 1)[1].strip()
             if slot_info["locator"] != "Unknown":
                 slots.append(slot_info)
     except: pass
+
+    # Sort by locator so physical left-to-right order is preserved (A1, A2, B1, B2…)
+    slots.sort(key=lambda s: s["locator"])
+
     if not slots:
         for i in range(1, 5):
-            slots.append({"locator": f"DIMM_{i}", "size": "No Module Installed", "speed": "N/A", "type": "N/A", "ram_manufacturer": "N/A", "ram_model": "N/A", "active": False})
+            slots.append({"locator": f"DIMM_{i}", "size": "No Module Installed",
+                          "max_capacity": mobo["max_per_slot"], "speed": "N/A",
+                          "type": "N/A", "ram_manufacturer": "N/A", "ram_model": "N/A", "active": False})
     return mobo, slots
 
 def collect_hardware_data_bg():
@@ -340,16 +390,14 @@ hw_layout = make_hw_layout()
 # Keyboard: put stdin in cbreak mode so each keypress is available immediately
 # without waiting for Enter. Handled in the main loop via select() — no thread.
 _kb_ok = False
-_kb_error = "n/a"
 _last_key = "-"
 _stdin_fd = sys.stdin.fileno()
 if os.name != 'nt':
     try:
         tty.setcbreak(_stdin_fd)
         _kb_ok = True
-        _kb_error = "ok"
-    except Exception as e:
-        _kb_error = str(e)[:30]
+    except Exception:
+        pass
 
 try:
     with Live(main_layout, refresh_per_second=4, screen=True) as live:
@@ -385,17 +433,22 @@ try:
                         slots = hw_cache['ram_slots']
                         ram_group = []
                         if not mobo["root_active"]:
-                            ram_group.append(Text(" (!) RUN DASHBOARD AS ROOT (SUDO) FOR RAW SMBIOS READS", style="bold yellow"))
-                        ram_group.append(Text(f" Board: {mobo['manufacturer']} ({mobo['model']}) | Sized Modules: {len([s for s in slots if s['active']])}/{len(slots)}", style="dim white"))
+                            ram_group.append(Text(" (!) RUN AS ROOT (SUDO) FOR REAL SMBIOS DATA", style="bold yellow"))
+                        active_count = len([s for s in slots if s['active']])
+                        ram_group.append(Text(f" {mobo['manufacturer']} {mobo['model']} | {active_count}/{len(slots)} slots populated | Max/slot: {mobo['max_per_slot']}", style="dim white"))
                         ram_table = Table(expand=True, box=None, padding=(0, 1))
-                        ram_table.add_column("Slot", style="cyan")
-                        ram_table.add_column("Status", style="bold green")
-                        ram_table.add_column("Capacity", style="orange1")
-                        ram_table.add_column("Vendor / Part Model", style="dim")
-                        for s in slots[:4]:
+                        ram_table.add_column("Slot", style="cyan", no_wrap=True)
+                        ram_table.add_column("Status", style="bold green", no_wrap=True)
+                        ram_table.add_column("Installed / Max", style="orange1", no_wrap=True)
+                        ram_table.add_column("Speed", style="yellow", no_wrap=True)
+                        ram_table.add_column("Vendor / Part", style="dim")
+                        for s in slots:
                             status_str = "● ONLINE" if s["active"] else "○ EMPTY"
                             status_style = "bold green" if s["active"] else "dim red"
-                            ram_table.add_row(Text(s["locator"]), Text(status_str, style=status_style), Text(s["size"]), Text(f"{s['ram_manufacturer'][:12]} / {s['ram_model'][:12]}"))
+                            installed = s["size"] if s["active"] else "—"
+                            cap_str = f"{installed} / {s.get('max_capacity', mobo['max_per_slot'])}"
+                            vendor = f"{s['ram_manufacturer'][:10]} / {s['ram_model'][:14]}" if s["active"] else "—"
+                            ram_table.add_row(Text(s["locator"]), Text(status_str, style=status_style), Text(cap_str), Text(s["speed"]), Text(vendor))
                         ram_group.append(ram_table)
                         cur['body']['hw_row1']['hw_ram'].update(Panel(Group(*ram_group), title='RAM MEMORY DEVICE TOPOLOGY', border_style='cyan'))
 
@@ -502,12 +555,10 @@ try:
 
                 uptime = str(datetime.now() - datetime.fromtimestamp(psutil.boot_time())).split('.')[0]
                 if CURRENT_STATE == "HARDWARE":
-                    nav_hint = "Press '1' or 'R' to Return to Main"
+                    footer_text = f"STATUS: ONLINE | SCALE: {DISPLAY_UNIT} (B/M) | VIEW: HARDWARE EXPLORER | Press '1' to Return to Main Dashboard | UPTIME: {uptime}"
                 else:
-                    nav_hint = "Press '2' for Hardware | [Ctrl+C] Exit"
-                debug = f"[v5] kb={_kb_error} key={_last_key} state={CURRENT_STATE}"
-                footer_line = f"{debug} | {DISPLAY_UNIT} (B/M) | {nav_hint} | UP:{uptime}"
-                cur['footer'].update(Align.center(Text(footer_line, style='dim')))
+                    footer_text = f"STATUS: ONLINE | SCALE: {DISPLAY_UNIT} (B/M) | Press '2' for Hardware Diagnostics | [Ctrl+C] to Exit | UPTIME: {uptime}"
+                cur['footer'].update(Align.center(Text(footer_text, style='dim')))
 
                 live.update(cur)
 
@@ -524,7 +575,6 @@ try:
                     raw = os.read(_stdin_fd, 1)
                     if raw:
                         key = raw.decode('utf-8', errors='ignore').lower()
-                        _last_key = repr(key)
                         if key in ['b', 'm']:
                             DISPLAY_UNIT = 'MB' if DISPLAY_UNIT == 'GB' else 'GB'
                         elif key == '2' and CURRENT_STATE == "MAIN":
@@ -532,10 +582,10 @@ try:
                             hw_cache['progress'] = 0
                             CURRENT_STATE = "HARDWARE"
                             threading.Thread(target=collect_hardware_data_bg, daemon=True).start()
-                        elif key in ['1', 'r']:
+                        elif key == '1':
                             CURRENT_STATE = "MAIN"
-                except Exception as e:
-                    _last_key = f"err:{e}"
+                except Exception:
+                    pass
             else:
                 time.sleep(0.25)
 
